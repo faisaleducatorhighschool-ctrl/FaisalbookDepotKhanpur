@@ -1,0 +1,52 @@
+# ── Build outputs ────────────────────────────
+dist
+tmp
+out-tsc
+*.tsbuildinfo
+
+# ── Dependencies ─────────────────────────────
+node_modules
+
+# ── Environment / Secrets ────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Expo ─────────────────────────────────────
+.expo
+.expo-shared
+
+# ── IDEs ─────────────────────────────────────
+/.idea
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# ── OS Files ─────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────
+npm-debug.log
+yarn-error.log
+*.log
+
+# ── Misc ─────────────────────────────────────
+/.sass-cache
+/connect.lock
+/coverage
+/typings
+
+# ── Replit internal ──────────────────────────
+.cache/
+.local/
+.cursor/rules/nx-rules.mdc
+.github/instructions/nx.instructions.md
