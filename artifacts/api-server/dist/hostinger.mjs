@@ -92408,7 +92408,13 @@ var DeleteBranchParams = objectType({
   "id": coerce.number()
 });
 var ListSalesQueryParams = objectType({
-  "date": coerce.string().optional()
+  "date": coerce.string().optional(),
+  "invoiceNumber": coerce.string().optional(),
+  "customerName": coerce.string().optional(),
+  "customerMobile": coerce.string().optional(),
+  "startDate": coerce.string().optional(),
+  "endDate": coerce.string().optional(),
+  "limit": coerce.number().optional()
 });
 var ListSalesResponseItem = objectType({
   "id": numberType(),
@@ -113925,6 +113931,7 @@ var salesTable = pgTable("sales", {
   dueAmount: numeric("due_amount", { precision: 12, scale: 2 }).notNull().default("0"),
   isReturn: boolean("is_return").notNull().default(false),
   returnReason: text("return_reason"),
+  originalSaleId: integer("original_sale_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => /* @__PURE__ */ new Date())
 });
@@ -115800,6 +115807,7 @@ async function getSaleWithItems(id) {
     price: saleItemsTable.price,
     discount: saleItemsTable.discount
   }).from(saleItemsTable).where(eq(saleItemsTable.saleId, id));
+  const returnedMap = await getReturnedQtyByProduct(id);
   return {
     ...s,
     subtotal: Number(s.subtotal),
@@ -115809,17 +115817,38 @@ async function getSaleWithItems(id) {
     paidAmount: Number(s.paidAmount),
     dueAmount: Number(s.dueAmount),
     createdAt: s.createdAt.toISOString(),
-    items: items.map((i) => ({ ...i, price: Number(i.price), discount: Number(i.discount) }))
+    items: items.map((i) => ({
+      ...i,
+      price: Number(i.price),
+      discount: Number(i.discount),
+      returnedQuantity: returnedMap.get(i.productId) ?? 0
+    }))
   };
+}
+async function getReturnedQtyByProduct(originalSaleId) {
+  const rows = await db.select({ productId: saleItemsTable.productId, qty: sql`sum(${saleItemsTable.quantity})` }).from(saleItemsTable).innerJoin(salesTable, eq(saleItemsTable.saleId, salesTable.id)).where(eq(salesTable.originalSaleId, originalSaleId)).groupBy(saleItemsTable.productId);
+  const map2 = /* @__PURE__ */ new Map();
+  for (const r of rows) map2.set(r.productId, Number(r.qty));
+  return map2;
 }
 router18.get("/sales", requireAuth, async (req, res) => {
   const params = ListSalesQueryParams.safeParse(req.query);
-  const limit = params.success && params.data.limit ? params.data.limit : 200;
+  const q = params.success ? params.data : {};
+  const limit = q.limit ? Number(q.limit) : 200;
+  const conditions = [];
+  if (q.date) conditions.push(sql`${salesTable.createdAt}::date = ${String(q.date)}::date`);
+  if (q.startDate) conditions.push(sql`${salesTable.createdAt}::date >= ${String(q.startDate)}::date`);
+  if (q.endDate) conditions.push(sql`${salesTable.createdAt}::date <= ${String(q.endDate)}::date`);
+  if (q.invoiceNumber) conditions.push(sql`${salesTable.invoiceNumber} ILIKE ${"%" + String(q.invoiceNumber) + "%"}`);
+  if (q.customerName) conditions.push(sql`(select name from customers where id = sales.customer_id) ILIKE ${"%" + String(q.customerName) + "%"}`);
+  if (q.customerMobile) conditions.push(sql`(select phone from customers where id = sales.customer_id) ILIKE ${"%" + String(q.customerMobile) + "%"}`);
+  const where = conditions.length ? sql.join(conditions, sql` AND `) : void 0;
   const sales = await db.select({
     id: salesTable.id,
     invoiceNumber: salesTable.invoiceNumber,
     customerId: salesTable.customerId,
     customerName: sql`(select name from customers where id = sales.customer_id)`,
+    customerMobile: sql`(select phone from customers where id = sales.customer_id)`,
     type: salesTable.type,
     paymentMethod: salesTable.paymentMethod,
     subtotal: salesTable.subtotal,
@@ -115831,7 +115860,7 @@ router18.get("/sales", requireAuth, async (req, res) => {
     isReturn: salesTable.isReturn,
     returnReason: salesTable.returnReason,
     createdAt: salesTable.createdAt
-  }).from(salesTable).orderBy(sql`created_at desc`).limit(limit);
+  }).from(salesTable).where(where).orderBy(sql`created_at desc`).limit(limit);
   res.json(sales.map((s) => ({
     ...s,
     subtotal: Number(s.subtotal),
@@ -115862,7 +115891,18 @@ router18.post("/sales", requireAuth, async (req, res) => {
   }
   const subtotal = items.reduce((s, i) => s + i.price * i.quantity - (i.discount ?? 0), 0);
   const totalAmount = subtotal - (discount ?? 0) + (tax ?? 0);
-  const due = totalAmount - (paidAmount ?? totalAmount);
+  const finalPaid = paidAmount ?? totalAmount;
+  const due = totalAmount - finalPaid;
+  if (!customerId) {
+    if ((type ?? "cash") === "credit" || (paymentMethod ?? "cash") === "credit") {
+      res.status(400).json({ error: "Walk-in customers cannot be billed on credit. Select a customer or collect full payment." });
+      return;
+    }
+    if (due > 9e-3) {
+      res.status(400).json({ error: "Walk-in sale must be fully paid. Cash received is less than the total amount." });
+      return;
+    }
+  }
   const invoiceNumber = `INV-${Date.now()}`;
   const [sale] = await db.insert(salesTable).values({
     invoiceNumber,
@@ -115912,6 +115952,23 @@ router18.post("/sales/manual-return", requireAuth, async (req, res) => {
     res.status(400).json({ error: "items must be a non-empty array" });
     return;
   }
+  for (const it of items) {
+    const pid = Number(it.productId);
+    const reqQty = Number(it.quantity);
+    const price = Number(it.price);
+    if (!Number.isFinite(pid) || pid <= 0) {
+      res.status(400).json({ error: "Invalid product in return items." });
+      return;
+    }
+    if (!Number.isInteger(reqQty) || reqQty <= 0) {
+      res.status(400).json({ error: "Return quantity must be a positive whole number." });
+      return;
+    }
+    if (!Number.isFinite(price) || price < 0) {
+      res.status(400).json({ error: "Return price must be zero or greater." });
+      return;
+    }
+  }
   const subtotal = items.reduce((s, i) => s + Number(i.price) * Number(i.quantity), 0);
   const invoiceNumber = `RET-${Date.now()}`;
   const [sale] = await db.insert(salesTable).values({
@@ -115956,10 +116013,62 @@ router18.post("/sales/:id/return", requireAuth, async (req, res) => {
     res.status(400).json({ error: "items must be a non-empty array" });
     return;
   }
+  const [original] = await db.select({ id: salesTable.id, isReturn: salesTable.isReturn, customerId: salesTable.customerId }).from(salesTable).where(eq(salesTable.id, id));
+  if (!original) {
+    res.status(404).json({ error: "Original invoice not found." });
+    return;
+  }
+  if (original.isReturn) {
+    res.status(400).json({ error: "Cannot return a return invoice." });
+    return;
+  }
+  const soldRows = await db.select({ productId: saleItemsTable.productId, quantity: saleItemsTable.quantity }).from(saleItemsTable).where(eq(saleItemsTable.saleId, id));
+  const soldMap = /* @__PURE__ */ new Map();
+  for (const r of soldRows) soldMap.set(r.productId, (soldMap.get(r.productId) ?? 0) + r.quantity);
+  const alreadyReturned = await getReturnedQtyByProduct(id);
+  const fullyReturned = soldRows.length > 0 && [...soldMap.entries()].every(([pid, qty]) => (alreadyReturned.get(pid) ?? 0) >= qty);
+  if (fullyReturned) {
+    res.status(409).json({ error: "This invoice has already been fully returned." });
+    return;
+  }
+  const requestedMap = /* @__PURE__ */ new Map();
+  for (const it of items) {
+    const pid = Number(it.productId);
+    const reqQty = Number(it.quantity);
+    const price = Number(it.price);
+    if (!Number.isFinite(pid) || pid <= 0) {
+      res.status(400).json({ error: "Invalid product in return items." });
+      return;
+    }
+    if (!Number.isInteger(reqQty) || reqQty <= 0) {
+      res.status(400).json({ error: "Return quantity must be a positive whole number." });
+      return;
+    }
+    if (!Number.isFinite(price) || price < 0) {
+      res.status(400).json({ error: "Return price must be zero or greater." });
+      return;
+    }
+    requestedMap.set(pid, (requestedMap.get(pid) ?? 0) + reqQty);
+  }
+  for (const [pid, reqQty] of requestedMap.entries()) {
+    const sold = soldMap.get(pid) ?? 0;
+    if (sold === 0) {
+      res.status(400).json({ error: "One of the items was not part of this invoice." });
+      return;
+    }
+    const remaining = sold - (alreadyReturned.get(pid) ?? 0);
+    if (reqQty > remaining) {
+      res.status(409).json({
+        error: remaining <= 0 ? "This item has already been fully returned." : `Only ${remaining} unit(s) remain returnable for this item.`
+      });
+      return;
+    }
+  }
   const subtotal = items.reduce((s, i) => s + Number(i.price) * Number(i.quantity), 0);
   const invoiceNumber = `RET-${Date.now()}`;
   const [sale] = await db.insert(salesTable).values({
     invoiceNumber,
+    customerId: original.customerId ?? null,
     type: "return",
     paymentMethod: "cash",
     subtotal: String(subtotal),
@@ -115969,7 +116078,8 @@ router18.post("/sales/:id/return", requireAuth, async (req, res) => {
     paidAmount: String(subtotal),
     dueAmount: "0",
     isReturn: true,
-    returnReason: String(returnReason)
+    returnReason: String(returnReason),
+    originalSaleId: id
   }).returning();
   await db.insert(saleItemsTable).values(items.map((i) => ({
     saleId: sale.id,
@@ -116881,11 +116991,13 @@ router22.get("/ledger/customer/:id", requireAuth, async (req, res) => {
     return;
   }
   const [openingData] = await xr4(sql`
-    SELECT coalesce(sum(due_amount::numeric), 0) as opening_balance
+    SELECT
+      coalesce(sum(CASE WHEN is_return = false THEN due_amount::numeric ELSE 0 END), 0)
+        - coalesce(sum(CASE WHEN is_return = true THEN total_amount::numeric ELSE 0 END), 0)
+        as opening_balance
     FROM sales
     WHERE customer_id = ${id}
       AND created_at::date < ${startDate}::date
-      AND is_return = false
   `);
   const transactions = await xr4(sql`
     SELECT
@@ -117781,8 +117893,8 @@ app.use(
   })
 );
 app.use((0, import_cors.default)());
-app.use(import_express26.default.json());
-app.use(import_express26.default.urlencoded({ extended: true }));
+app.use(import_express26.default.json({ limit: "12mb" }));
+app.use(import_express26.default.urlencoded({ extended: true, limit: "12mb" }));
 app.use("/api", routes_default);
 app.use("/api", (_req, res) => {
   res.status(404).json({ error: "Not Found" });
