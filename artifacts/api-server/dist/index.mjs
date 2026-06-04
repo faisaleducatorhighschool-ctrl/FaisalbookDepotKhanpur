@@ -115357,10 +115357,15 @@ router13.post("/purchases/returns", requireAuth, async (req, res) => {
           );
         }
       }
+      let effectiveSupplierId = supplierId ?? null;
+      if (purchaseId) {
+        const [po] = await xrt(sql`SELECT supplier_id FROM purchases WHERE id = ${purchaseId}`);
+        effectiveSupplierId = po?.supplier_id != null ? Number(po.supplier_id) : null;
+      }
       const [created] = await tx.insert(purchaseReturnsTable).values({
         returnNumber,
         purchaseId: purchaseId ?? null,
-        supplierId: supplierId ?? null,
+        supplierId: effectiveSupplierId,
         totalAmount: String(total),
         notes: notes ?? null,
         returnReason: returnReason ?? null
@@ -115373,6 +115378,33 @@ router13.post("/purchases/returns", requireAuth, async (req, res) => {
       })));
       for (const [productId, wantQty] of productOrder) {
         await tx.execute(sql`UPDATE products SET stock = GREATEST(0, stock - ${wantQty}) WHERE id = ${productId}`);
+      }
+      await tx.insert(inventoryMovementsTable).values(
+        productOrder.map(([productId, wantQty]) => ({
+          productId,
+          type: "stock_out",
+          quantity: wantQty,
+          notes: `Supplier return ${returnNumber}${returnReason ? ` (${returnReason})` : ""}`
+        }))
+      );
+      if (effectiveSupplierId) {
+        await xrt(sql`SELECT id FROM suppliers WHERE id = ${effectiveSupplierId} FOR UPDATE`);
+        const [last] = await xrt(sql`
+          SELECT balance::numeric as balance FROM ledger_entries
+          WHERE entity_type = 'supplier' AND entity_id = ${effectiveSupplierId}
+          ORDER BY created_at DESC, id DESC LIMIT 1
+        `);
+        const prevBalance = Number(last?.balance ?? 0);
+        const newBalance = prevBalance - total;
+        await tx.insert(ledgerEntriesTable).values({
+          entityType: "supplier",
+          entityId: effectiveSupplierId,
+          type: "debit",
+          amount: String(total),
+          balance: String(newBalance),
+          description: `Purchase return ${returnNumber}${returnReason ? ` \u2014 ${returnReason}` : ""}`,
+          referenceId: created.id
+        });
       }
       return created;
     });
@@ -116677,7 +116709,7 @@ router19.get("/reports/cash-handling", requireAuth, async (req, res) => {
 });
 router19.get("/reports/business-analysis", requireAuth, async (req, res) => {
   const { startDate, endDate } = dateRange(req);
-  const [[sales], [purchasesRow], [expensesRow], [cogs], [returns], topProducts] = await Promise.all([
+  const [[sales], [purchasesRow], [purchaseReturnsRow], [expensesRow], [cogs], [returns], topProducts] = await Promise.all([
     xr3(sql`
       SELECT
         coalesce(sum(total_amount::numeric), 0) as revenue,
@@ -116691,6 +116723,10 @@ router19.get("/reports/business-analysis", requireAuth, async (req, res) => {
     xr3(sql`
       SELECT coalesce(sum(total_amount::numeric), 0) as total
       FROM purchases WHERE created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+    `),
+    xr3(sql`
+      SELECT coalesce(sum(total_amount::numeric), 0) as total, count(*) as count
+      FROM purchase_returns WHERE created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
     `),
     xr3(sql`
       SELECT coalesce(sum(amount::numeric), 0) as total
@@ -116729,6 +116765,9 @@ router19.get("/reports/business-analysis", requireAuth, async (req, res) => {
     uniqueCustomers: Number(sales?.unique_customers ?? 0),
     avgOrderValue: Number(sales?.avg_order_value ?? 0),
     purchases: Number(purchasesRow?.total ?? 0),
+    purchaseReturns: Number(purchaseReturnsRow?.total ?? 0),
+    purchaseReturnsCount: Number(purchaseReturnsRow?.count ?? 0),
+    netPurchases: Number(purchasesRow?.total ?? 0) - Number(purchaseReturnsRow?.total ?? 0),
     expenses: expensesVal,
     cogs: cogsVal,
     grossProfit,
