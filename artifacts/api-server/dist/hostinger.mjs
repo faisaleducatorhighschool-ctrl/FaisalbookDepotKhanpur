@@ -117921,7 +117921,15 @@ if (process.env.NODE_ENV === "production") {
 var app_default = app;
 
 // src/seed.ts
+async function ensureSchema() {
+  try {
+    await db.execute(sql`ALTER TABLE sales ADD COLUMN IF NOT EXISTS original_sale_id integer`);
+  } catch (err) {
+    logger.error({ err }, "ensureSchema failed");
+  }
+}
 async function seed() {
+  await ensureSchema();
   const [existingAdmin] = await db.select().from(usersTable).where(eq(usersTable.username, "admin"));
   if (existingAdmin) {
     logger.info("Database already seeded, skipping.");
