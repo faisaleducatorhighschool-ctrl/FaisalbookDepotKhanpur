@@ -31,6 +31,27 @@ try {
 }
 // --------------------------------------------------------------------------
 
+// --- Node 18 compatibility ------------------------------------------------
+// The bundled server pulls in storage libraries that reference the global
+// `File` class. `File` only became a Node global in v20, so on Hostinger's
+// Node 18 the bundle throws `ReferenceError: File is not defined` while
+// loading. The storage feature is unused on Hostinger, so a working/stub
+// `File` is enough to let the module load.
+if (typeof globalThis.File === "undefined") {
+  try {
+    globalThis.File = require("node:buffer").File;
+  } catch (e) {}
+  if (typeof globalThis.File === "undefined") {
+    try {
+      globalThis.File = require("undici").File;
+    } catch (e) {}
+  }
+  if (typeof globalThis.File === "undefined") {
+    globalThis.File = class File {};
+  }
+}
+// --------------------------------------------------------------------------
+
 // Default to production so the bundled server serves the three web apps.
 process.env.NODE_ENV = process.env.NODE_ENV || "production";
 
