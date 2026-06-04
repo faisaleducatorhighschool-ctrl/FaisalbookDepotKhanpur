@@ -12,6 +12,25 @@
 // app still works if Hostinger runs it as a standalone process.
 const express = require("express");
 
+// --- LiteSpeed (lsnode) compatibility -------------------------------------
+// Hostinger runs Node under LiteSpeed's lsnode, which occupies file
+// descriptor 0. Node's lazy `process.stdin` getter tries to wrap fd 0 in a
+// Socket and throws `Error: open EEXIST`, which crashes ESM module loading
+// while Node builds the `process` facade. The server never reads stdin, so we
+// pre-define a harmless empty readable stream before anything touches it.
+try {
+  const { Readable } = require("stream");
+  Object.defineProperty(process, "stdin", {
+    value: Readable.from([]),
+    configurable: true,
+    enumerable: true,
+    writable: false,
+  });
+} catch (e) {
+  console.error("Could not patch process.stdin:", e && e.message);
+}
+// --------------------------------------------------------------------------
+
 // Default to production so the bundled server serves the three web apps.
 process.env.NODE_ENV = process.env.NODE_ENV || "production";
 
