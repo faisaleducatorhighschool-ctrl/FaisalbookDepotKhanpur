@@ -92043,16 +92043,29 @@ var GetSupplierLedgerResponseItem = objectType({
   "createdAt": stringType()
 });
 var GetSupplierLedgerResponse = arrayType(GetSupplierLedgerResponseItem);
+var ListPurchasesQueryParams = objectType({
+  "date": coerce.string().optional(),
+  "startDate": coerce.string().optional(),
+  "endDate": coerce.string().optional(),
+  "purchaseNumber": coerce.string().optional(),
+  "supplierName": coerce.string().optional(),
+  "supplierMobile": coerce.string().optional(),
+  "productName": coerce.string().optional(),
+  "limit": coerce.number().optional()
+});
 var ListPurchasesResponseItem = objectType({
   "id": numberType(),
   "purchaseNumber": stringType(),
   "supplierId": numberType(),
   "supplierName": stringType().nullish(),
+  "supplierMobile": stringType().nullish(),
   "status": stringType(),
   "totalAmount": numberType(),
   "paidAmount": numberType().optional(),
   "dueAmount": numberType().optional(),
   "notes": stringType().nullish(),
+  "createdByName": stringType().nullish(),
+  "hasReturns": booleanType().optional(),
   "items": arrayType(objectType({
     "id": numberType(),
     "productId": numberType(),
@@ -92081,11 +92094,14 @@ var GetPurchaseResponse = objectType({
   "purchaseNumber": stringType(),
   "supplierId": numberType(),
   "supplierName": stringType().nullish(),
+  "supplierMobile": stringType().nullish(),
   "status": stringType(),
   "totalAmount": numberType(),
   "paidAmount": numberType().optional(),
   "dueAmount": numberType().optional(),
   "notes": stringType().nullish(),
+  "createdByName": stringType().nullish(),
+  "hasReturns": booleanType().optional(),
   "items": arrayType(objectType({
     "id": numberType(),
     "productId": numberType(),
@@ -92108,11 +92124,14 @@ var UpdatePurchaseResponse = objectType({
   "purchaseNumber": stringType(),
   "supplierId": numberType(),
   "supplierName": stringType().nullish(),
+  "supplierMobile": stringType().nullish(),
   "status": stringType(),
   "totalAmount": numberType(),
   "paidAmount": numberType().optional(),
   "dueAmount": numberType().optional(),
   "notes": stringType().nullish(),
+  "createdByName": stringType().nullish(),
+  "hasReturns": booleanType().optional(),
   "items": arrayType(objectType({
     "id": numberType(),
     "productId": numberType(),
@@ -92416,6 +92435,7 @@ var ListSalesQueryParams = objectType({
   "invoiceNumber": coerce.string().optional(),
   "customerName": coerce.string().optional(),
   "customerMobile": coerce.string().optional(),
+  "productName": coerce.string().optional(),
   "startDate": coerce.string().optional(),
   "endDate": coerce.string().optional(),
   "limit": coerce.number().optional()
@@ -92425,6 +92445,7 @@ var ListSalesResponseItem = objectType({
   "invoiceNumber": stringType(),
   "customerId": numberType().nullish(),
   "customerName": stringType().nullish(),
+  "customerMobile": stringType().nullish(),
   "type": stringType(),
   "paymentMethod": stringType(),
   "subtotal": numberType().optional(),
@@ -92434,6 +92455,9 @@ var ListSalesResponseItem = objectType({
   "paidAmount": numberType().optional(),
   "dueAmount": numberType().optional(),
   "isReturn": booleanType().optional(),
+  "returnReason": stringType().nullish(),
+  "createdByName": stringType().nullish(),
+  "hasReturns": booleanType().optional(),
   "items": arrayType(objectType({
     "id": numberType(),
     "productId": numberType(),
@@ -92467,6 +92491,7 @@ var GetSaleResponse = objectType({
   "invoiceNumber": stringType(),
   "customerId": numberType().nullish(),
   "customerName": stringType().nullish(),
+  "customerMobile": stringType().nullish(),
   "type": stringType(),
   "paymentMethod": stringType(),
   "subtotal": numberType().optional(),
@@ -92476,6 +92501,9 @@ var GetSaleResponse = objectType({
   "paidAmount": numberType().optional(),
   "dueAmount": numberType().optional(),
   "isReturn": booleanType().optional(),
+  "returnReason": stringType().nullish(),
+  "createdByName": stringType().nullish(),
+  "hasReturns": booleanType().optional(),
   "items": arrayType(objectType({
     "id": numberType(),
     "productId": numberType(),
@@ -113829,6 +113857,7 @@ var purchasesTable = pgTable("purchases", {
   paidAmount: numeric("paid_amount", { precision: 12, scale: 2 }).notNull().default("0"),
   dueAmount: numeric("due_amount", { precision: 12, scale: 2 }).notNull().default("0"),
   notes: text("notes"),
+  createdById: integer("created_by_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => /* @__PURE__ */ new Date())
 });
@@ -113936,6 +113965,7 @@ var salesTable = pgTable("sales", {
   isReturn: boolean("is_return").notNull().default(false),
   returnReason: text("return_reason"),
   originalSaleId: integer("original_sale_id"),
+  createdById: integer("created_by_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => /* @__PURE__ */ new Date())
 });
@@ -115196,11 +115226,14 @@ async function getPurchaseWithItems(id) {
     purchaseNumber: purchasesTable.purchaseNumber,
     supplierId: purchasesTable.supplierId,
     supplierName: sql`(select name from suppliers where id = purchases.supplier_id)`,
+    supplierMobile: sql`(select phone from suppliers where id = purchases.supplier_id)`,
     status: purchasesTable.status,
     totalAmount: purchasesTable.totalAmount,
     paidAmount: purchasesTable.paidAmount,
     dueAmount: purchasesTable.dueAmount,
     notes: purchasesTable.notes,
+    createdByName: sql`(select name from users where id = purchases.created_by_id)`,
+    hasReturns: sql`exists(select 1 from purchase_returns pr where pr.purchase_id = purchases.id)`,
     createdAt: purchasesTable.createdAt
   }).from(purchasesTable).where(eq(purchasesTable.id, id));
   if (!p) return null;
@@ -115332,19 +115365,34 @@ router13.post("/purchases/returns", requireAuth, async (req, res) => {
     items
   });
 });
-router13.get("/purchases", requireAuth, async (_req, res) => {
+router13.get("/purchases", requireAuth, async (req, res) => {
+  const q = req.query;
+  const parsedLimit = q.limit ? Number(q.limit) : NaN;
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(Math.floor(parsedLimit), 5e3) : 500;
+  const conditions = [];
+  if (q.date) conditions.push(sql`${purchasesTable.createdAt}::date = ${String(q.date)}::date`);
+  if (q.startDate) conditions.push(sql`${purchasesTable.createdAt}::date >= ${String(q.startDate)}::date`);
+  if (q.endDate) conditions.push(sql`${purchasesTable.createdAt}::date <= ${String(q.endDate)}::date`);
+  if (q.purchaseNumber) conditions.push(sql`${purchasesTable.purchaseNumber} ILIKE ${"%" + String(q.purchaseNumber) + "%"}`);
+  if (q.supplierName) conditions.push(sql`(select name from suppliers where id = purchases.supplier_id) ILIKE ${"%" + String(q.supplierName) + "%"}`);
+  if (q.supplierMobile) conditions.push(sql`(select phone from suppliers where id = purchases.supplier_id) ILIKE ${"%" + String(q.supplierMobile) + "%"}`);
+  if (q.productName) conditions.push(sql`exists(select 1 from purchase_items pi join products p on p.id = pi.product_id where pi.purchase_id = purchases.id and p.name ILIKE ${"%" + String(q.productName) + "%"})`);
+  const where = conditions.length ? sql.join(conditions, sql` AND `) : void 0;
   const purchases = await db.select({
     id: purchasesTable.id,
     purchaseNumber: purchasesTable.purchaseNumber,
     supplierId: purchasesTable.supplierId,
     supplierName: sql`(select name from suppliers where id = purchases.supplier_id)`,
+    supplierMobile: sql`(select phone from suppliers where id = purchases.supplier_id)`,
     status: purchasesTable.status,
     totalAmount: purchasesTable.totalAmount,
     paidAmount: purchasesTable.paidAmount,
     dueAmount: purchasesTable.dueAmount,
     notes: purchasesTable.notes,
+    createdByName: sql`(select name from users where id = purchases.created_by_id)`,
+    hasReturns: sql`exists(select 1 from purchase_returns pr where pr.purchase_id = purchases.id)`,
     createdAt: purchasesTable.createdAt
-  }).from(purchasesTable).orderBy(sql`created_at desc`);
+  }).from(purchasesTable).where(where).orderBy(sql`created_at desc`).limit(limit);
   res.json(purchases.map((p) => ({
     ...p,
     totalAmount: Number(p.totalAmount),
@@ -115371,7 +115419,8 @@ router13.post("/purchases", requireAuth, async (req, res) => {
     totalAmount: String(total),
     paidAmount: String(paidAmount ?? 0),
     dueAmount: String(due),
-    status: "received"
+    status: "received",
+    createdById: req.user?.userId ?? null
   }).returning();
   await db.insert(purchaseItemsTable).values(items.map((i) => ({
     purchaseId: purchase.id,
@@ -115790,6 +115839,7 @@ async function getSaleWithItems(id) {
     invoiceNumber: salesTable.invoiceNumber,
     customerId: salesTable.customerId,
     customerName: sql`(select name from customers where id = sales.customer_id)`,
+    customerMobile: sql`(select phone from customers where id = sales.customer_id)`,
     type: salesTable.type,
     paymentMethod: salesTable.paymentMethod,
     subtotal: salesTable.subtotal,
@@ -115800,6 +115850,8 @@ async function getSaleWithItems(id) {
     dueAmount: salesTable.dueAmount,
     isReturn: salesTable.isReturn,
     returnReason: salesTable.returnReason,
+    createdByName: sql`(select name from users where id = sales.created_by_id)`,
+    hasReturns: sql`exists(select 1 from sales r where r.original_sale_id = sales.id)`,
     createdAt: salesTable.createdAt
   }).from(salesTable).where(eq(salesTable.id, id));
   if (!s) return null;
@@ -115846,6 +115898,7 @@ router18.get("/sales", requireAuth, async (req, res) => {
   if (q.invoiceNumber) conditions.push(sql`${salesTable.invoiceNumber} ILIKE ${"%" + String(q.invoiceNumber) + "%"}`);
   if (q.customerName) conditions.push(sql`(select name from customers where id = sales.customer_id) ILIKE ${"%" + String(q.customerName) + "%"}`);
   if (q.customerMobile) conditions.push(sql`(select phone from customers where id = sales.customer_id) ILIKE ${"%" + String(q.customerMobile) + "%"}`);
+  if (q.productName) conditions.push(sql`exists(select 1 from sale_items si join products p on p.id = si.product_id where si.sale_id = sales.id and p.name ILIKE ${"%" + String(q.productName) + "%"})`);
   const where = conditions.length ? sql.join(conditions, sql` AND `) : void 0;
   const sales = await db.select({
     id: salesTable.id,
@@ -115863,6 +115916,8 @@ router18.get("/sales", requireAuth, async (req, res) => {
     dueAmount: salesTable.dueAmount,
     isReturn: salesTable.isReturn,
     returnReason: salesTable.returnReason,
+    createdByName: sql`(select name from users where id = sales.created_by_id)`,
+    hasReturns: sql`exists(select 1 from sales r where r.original_sale_id = sales.id)`,
     createdAt: salesTable.createdAt
   }).from(salesTable).where(where).orderBy(sql`created_at desc`).limit(limit);
   res.json(sales.map((s) => ({
@@ -115918,7 +115973,8 @@ router18.post("/sales", requireAuth, async (req, res) => {
     tax: String(tax ?? 0),
     totalAmount: String(totalAmount),
     paidAmount: String(paidAmount ?? totalAmount),
-    dueAmount: String(due)
+    dueAmount: String(due),
+    createdById: req.user?.userId ?? null
   }).returning();
   await db.insert(saleItemsTable).values(items.map((i) => ({
     saleId: sale.id,
@@ -115987,7 +116043,8 @@ router18.post("/sales/manual-return", requireAuth, async (req, res) => {
     paidAmount: String(subtotal),
     dueAmount: "0",
     isReturn: true,
-    returnReason: String(returnReason)
+    returnReason: String(returnReason),
+    createdById: req.user?.userId ?? null
   }).returning();
   await db.insert(saleItemsTable).values(items.map((i) => ({
     saleId: sale.id,
@@ -116083,7 +116140,8 @@ router18.post("/sales/:id/return", requireAuth, async (req, res) => {
     dueAmount: "0",
     isReturn: true,
     returnReason: String(returnReason),
-    originalSaleId: id
+    originalSaleId: id,
+    createdById: req.user?.userId ?? null
   }).returning();
   await db.insert(saleItemsTable).values(items.map((i) => ({
     saleId: sale.id,
@@ -117951,6 +118009,8 @@ var app_default = app;
 async function ensureSchema() {
   try {
     await db.execute(sql`ALTER TABLE sales ADD COLUMN IF NOT EXISTS original_sale_id integer`);
+    await db.execute(sql`ALTER TABLE sales ADD COLUMN IF NOT EXISTS created_by_id integer`);
+    await db.execute(sql`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS created_by_id integer`);
   } catch (err) {
     logger.error({ err }, "ensureSchema failed");
   }
