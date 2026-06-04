@@ -1,11 +1,15 @@
 // Hostinger Node.js entry for Tech Mentor ERP & POS (Express app).
 //
-// Hostinger loads this file and reads `module.exports` SYNCHRONOUSLY to serve
-// the app. The real ERP/API/storefront server is a large ES module that can
-// only be loaded asynchronously (via dynamic import). To bridge that gap, we
-// export a small Express app immediately and forward every request to the real
-// server once it has finished loading. We also call listen() so the app still
-// works if Hostinger runs it as a standalone process.
+// Hostinger runs Node apps under LiteSpeed's lsnode, which reads
+// `module.exports` and feeds requests to it. It does NOT reliably keep
+// background async work alive between requests, so a "load in the background
+// and reply 503 meanwhile" approach never finishes loading.
+//
+// Instead we export a small Express app immediately whose first middleware
+// AWAITS the (memoized) load of the real server, then forwards the request.
+// The first request to a fresh worker pays the load cost (a few seconds);
+// every later request in that worker is instant. We also call listen() so the
+// app still works if Hostinger runs it as a standalone process.
 const express = require("express");
 
 // Default to production so the bundled server serves the three web apps.
@@ -19,30 +23,46 @@ if (!process.env.PORT) {
 const proxy = express();
 
 let realApp = null;
+let loadPromise = null;
 let bootError = null;
-let timedOut = false;
 
-const startedAt = Date.now();
+// If the database settings are missing, the bundled server throws on import.
+// Detect that up front so the browser shows a clear, actionable message.
+if (!process.env.DATABASE_URL) {
+  bootError = new Error(
+    "DATABASE_URL is not set. Add it (and SESSION_SECRET) under " +
+      "Environment variables in the Hostinger dashboard, then redeploy.",
+  );
+  console.error(bootError.message);
+}
 
-// Friendly diagnostic page so a non-technical operator can see what is wrong
-// in the browser instead of an opaque "starting" message that never changes.
+// Memoized loader for the bundled server (it exports the Express app; it does
+// NOT listen). Returns a promise that resolves once `realApp` is ready.
+function ensureLoaded() {
+  if (realApp) return Promise.resolve();
+  if (bootError) return Promise.reject(bootError);
+  if (!loadPromise) {
+    loadPromise = import("./artifacts/api-server/dist/hostinger.mjs")
+      .then((mod) => {
+        realApp = mod.default || mod;
+        console.log("ERP server loaded and ready.");
+      })
+      .catch((err) => {
+        bootError = err;
+        console.error("Failed to load ERP server:", err);
+        throw err;
+      });
+  }
+  return loadPromise;
+}
+
+// Friendly diagnostic page shown only when loading actually fails.
 function diagnostics() {
-  const secs = Math.round((Date.now() - startedAt) / 1000);
   const hasDbUrl = Boolean(process.env.DATABASE_URL);
   const hasSecret = Boolean(process.env.SESSION_SECRET);
-  let detail = "";
-  if (bootError) {
-    detail =
-      "ERROR while loading the app:\n" +
-      (bootError && bootError.stack ? bootError.stack : String(bootError));
-  } else if (timedOut) {
-    detail =
-      "The app has not finished loading after " +
-      secs +
-      " seconds, which usually means a required setting is missing or the database is unreachable.";
-  } else {
-    detail = "Still loading (" + secs + "s).";
-  }
+  const detail =
+    "ERROR while loading the app:\n" +
+    (bootError && bootError.stack ? bootError.stack : String(bootError));
   return (
     "Tech Mentor ERP — startup status\n" +
     "================================\n\n" +
@@ -53,44 +73,21 @@ function diagnostics() {
   );
 }
 
-// Forward every request to the real server once it is ready.
-proxy.use((req, res, next) => {
-  if (realApp) {
-    realApp(req, res, next);
+// Hold each request until the real app is loaded, then forward it.
+proxy.use(async (req, res, next) => {
+  try {
+    await ensureLoaded();
+  } catch (err) {
+    res.status(500).type("text/plain").send(diagnostics());
     return;
   }
-  const status = bootError ? 500 : 503;
-  res.status(status).type("text/plain").send(diagnostics());
+  realApp(req, res, next);
 });
 
-// If the database settings are missing, the bundled server throws on import.
-// Detect that up front so the browser shows a clear, actionable message.
-if (!process.env.DATABASE_URL) {
-  bootError = new Error(
-    "DATABASE_URL is not set. Add it (and SESSION_SECRET) under " +
-      "Environment variables in the Hostinger dashboard, then redeploy.",
-  );
-  console.error(bootError.message);
-} else {
-  // Load the bundled server (it exports the Express app; it does NOT listen).
-  import("./artifacts/api-server/dist/hostinger.mjs")
-    .then((mod) => {
-      realApp = mod.default || mod;
-      console.log("ERP server loaded and ready.");
-    })
-    .catch((err) => {
-      bootError = err;
-      console.error("Failed to load ERP server:", err);
-    });
-
-  // Watchdog: if loading stalls, surface that in the browser instead of
-  // showing "starting" forever.
-  setTimeout(() => {
-    if (!realApp && !bootError) {
-      timedOut = true;
-      console.error("ERP server still not ready after 45s.");
-    }
-  }, 45000);
+// Start loading immediately so persistent workers are warm before the first
+// request arrives (harmless if the worker is short-lived).
+if (!bootError) {
+  ensureLoaded().catch(() => {});
 }
 
 // Listen for the standalone run model. Under hosts that bind the exported app
