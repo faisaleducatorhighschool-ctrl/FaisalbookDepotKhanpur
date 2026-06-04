@@ -115220,6 +115220,8 @@ async function xr2(q) {
   const r = await db.execute(q);
   return Array.isArray(r) ? r : r?.rows ?? [];
 }
+var ReturnValidationError = class extends Error {
+};
 async function getPurchaseWithItems(id) {
   const [p] = await db.select({
     id: purchasesTable.id,
@@ -115242,7 +115244,8 @@ async function getPurchaseWithItems(id) {
     productId: purchaseItemsTable.productId,
     productName: sql`(select name from products where id = purchase_items.product_id)`,
     quantity: purchaseItemsTable.quantity,
-    costPrice: purchaseItemsTable.costPrice
+    costPrice: purchaseItemsTable.costPrice,
+    returnedQuantity: sql`coalesce((select sum(pri.quantity) from purchase_return_items pri join purchase_returns pr on pr.id = pri.return_id where pr.purchase_id = ${id} and pri.product_id = purchase_items.product_id), 0)`
   }).from(purchaseItemsTable).where(eq(purchaseItemsTable.purchaseId, id));
   return {
     ...p,
@@ -115250,7 +115253,7 @@ async function getPurchaseWithItems(id) {
     paidAmount: Number(p.paidAmount),
     dueAmount: Number(p.dueAmount),
     createdAt: p.createdAt.toISOString(),
-    items: items.map((i) => ({ ...i, costPrice: Number(i.costPrice) }))
+    items: items.map((i) => ({ ...i, costPrice: Number(i.costPrice), returnedQuantity: Number(i.returnedQuantity ?? 0) }))
   };
 }
 function validatePurchaseReturnBody(body) {
@@ -115315,55 +115318,87 @@ router13.post("/purchases/returns", requireAuth, async (req, res) => {
     return;
   }
   const { purchaseId, supplierId, notes, returnReason, items } = parsed.data;
-  if (purchaseId) {
-    for (const item of items) {
-      const [orig] = await xr2(sql`
-        SELECT coalesce(sum(quantity), 0) as orig_qty FROM purchase_items
-        WHERE purchase_id = ${purchaseId} AND product_id = ${item.productId}
-      `);
-      const [already] = await xr2(sql`
-        SELECT coalesce(sum(pri.quantity), 0) as returned_qty
-        FROM purchase_return_items pri
-        JOIN purchase_returns pr ON pr.id = pri.return_id
-        WHERE pr.purchase_id = ${purchaseId} AND pri.product_id = ${item.productId}
-      `);
-      const maxReturn = Number(orig?.orig_qty ?? 0) - Number(already?.returned_qty ?? 0);
-      if (item.quantity > maxReturn) {
-        res.status(400).json({ error: `Return qty for product ${item.productId} exceeds available (max: ${maxReturn})` });
-        return;
-      }
-    }
+  const lineItems = items;
+  const qtyByProduct = /* @__PURE__ */ new Map();
+  for (const it of lineItems) {
+    qtyByProduct.set(it.productId, (qtyByProduct.get(it.productId) ?? 0) + it.quantity);
   }
-  const total = items.reduce((s, i) => s + i.costPrice * i.quantity, 0);
+  const productOrder = [...qtyByProduct.entries()].sort((a, b) => a[0] - b[0]);
+  const total = lineItems.reduce((s, i) => s + i.costPrice * i.quantity, 0);
   const returnNumber = `PR-${Date.now()}`;
-  const [ret] = await db.insert(purchaseReturnsTable).values({
-    returnNumber,
-    purchaseId: purchaseId ?? null,
-    supplierId: supplierId ?? null,
-    totalAmount: String(total),
-    notes: notes ?? null,
-    returnReason: returnReason ?? null
-  }).returning();
-  await db.insert(purchaseReturnItemsTable).values(items.map((i) => ({
-    returnId: ret.id,
-    productId: i.productId,
-    quantity: i.quantity,
-    costPrice: String(i.costPrice)
-  })));
-  for (const item of items) {
-    await db.execute(sql`UPDATE products SET stock = GREATEST(0, stock - ${item.quantity}) WHERE id = ${item.productId}`);
+  try {
+    const ret = await db.transaction(async (tx) => {
+      const xrt = async (q) => {
+        const r = await tx.execute(q);
+        return Array.isArray(r) ? r : r?.rows ?? [];
+      };
+      for (const [productId, wantQty] of productOrder) {
+        const [prod] = await xrt(sql`SELECT stock, name FROM products WHERE id = ${productId} FOR UPDATE`);
+        const currentStock = Number(prod?.stock ?? 0);
+        const prodName = prod?.name ?? `product ${productId}`;
+        let maxReturn = currentStock;
+        if (purchaseId) {
+          const [orig] = await xrt(sql`
+            SELECT coalesce(sum(quantity), 0) as orig_qty FROM purchase_items
+            WHERE purchase_id = ${purchaseId} AND product_id = ${productId}
+          `);
+          const [already] = await xrt(sql`
+            SELECT coalesce(sum(pri.quantity), 0) as returned_qty
+            FROM purchase_return_items pri
+            JOIN purchase_returns pr ON pr.id = pri.return_id
+            WHERE pr.purchase_id = ${purchaseId} AND pri.product_id = ${productId}
+          `);
+          const poRemaining = Number(orig?.orig_qty ?? 0) - Number(already?.returned_qty ?? 0);
+          maxReturn = Math.min(poRemaining, currentStock);
+        }
+        if (wantQty > maxReturn) {
+          throw new ReturnValidationError(
+            `Cannot return ${wantQty} of "${prodName}": only ${maxReturn} available in stock${purchaseId ? " for this PO (sold units can't be returned)" : ""}.`
+          );
+        }
+      }
+      const [created] = await tx.insert(purchaseReturnsTable).values({
+        returnNumber,
+        purchaseId: purchaseId ?? null,
+        supplierId: supplierId ?? null,
+        totalAmount: String(total),
+        notes: notes ?? null,
+        returnReason: returnReason ?? null
+      }).returning();
+      await tx.insert(purchaseReturnItemsTable).values(lineItems.map((i) => ({
+        returnId: created.id,
+        productId: i.productId,
+        quantity: i.quantity,
+        costPrice: String(i.costPrice)
+      })));
+      for (const [productId, wantQty] of productOrder) {
+        await tx.execute(sql`UPDATE products SET stock = GREATEST(0, stock - ${wantQty}) WHERE id = ${productId}`);
+      }
+      return created;
+    });
+    res.status(201).json({
+      id: ret.id,
+      returnNumber: ret.returnNumber,
+      purchaseId: ret.purchaseId,
+      supplierId: ret.supplierId,
+      totalAmount: Number(ret.totalAmount),
+      notes: ret.notes,
+      returnReason: ret.returnReason ?? null,
+      createdAt: ret.createdAt,
+      items: lineItems
+    });
+  } catch (e) {
+    if (e instanceof ReturnValidationError) {
+      res.status(400).json({ error: e.message });
+      return;
+    }
+    const code = e?.code;
+    if (code === "40P01" || code === "40001") {
+      res.status(409).json({ error: "Another return is processing these products. Please try again." });
+      return;
+    }
+    throw e;
   }
-  res.status(201).json({
-    id: ret.id,
-    returnNumber: ret.returnNumber,
-    purchaseId: ret.purchaseId,
-    supplierId: ret.supplierId,
-    totalAmount: Number(ret.totalAmount),
-    notes: ret.notes,
-    returnReason: ret.returnReason ?? null,
-    createdAt: ret.createdAt,
-    items
-  });
 });
 router13.get("/purchases", requireAuth, async (req, res) => {
   const q = req.query;
