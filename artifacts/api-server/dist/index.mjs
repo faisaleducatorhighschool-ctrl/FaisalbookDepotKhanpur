@@ -92535,11 +92535,16 @@ var GetSalesReportResponse = objectType({
   "totalRevenue": numberType(),
   "totalOrders": numberType(),
   "totalItems": numberType(),
+  "grossSales": numberType().optional(),
+  "salesReturns": numberType().optional(),
+  "netSales": numberType().optional(),
   "data": arrayType(objectType({
     "date": stringType(),
     "sales": numberType(),
     "orders": numberType(),
-    "revenue": numberType()
+    "revenue": numberType(),
+    "grossSales": numberType().optional(),
+    "salesReturns": numberType().optional()
   }))
 });
 var GetInventoryReportResponse = objectType({
@@ -92564,7 +92569,11 @@ var GetProfitLossReportResponse = objectType({
   "costOfGoods": numberType(),
   "grossProfit": numberType(),
   "expenses": numberType(),
-  "netProfit": numberType()
+  "netProfit": numberType(),
+  "grossSales": numberType().optional(),
+  "salesReturns": numberType().optional(),
+  "grossCogs": numberType().optional(),
+  "returnedCogs": numberType().optional()
 });
 var ListNotificationsResponseItem = objectType({
   "id": numberType(),
@@ -95114,6 +95123,17 @@ function requireAuth(req, res, next) {
     return;
   }
   req.user = payload;
+  next();
+}
+function requireAdmin(req, res, next) {
+  if (!req.user) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  if (req.user.role !== "admin") {
+    res.status(403).json({ error: "Forbidden: admin access required" });
+    return;
+  }
   next();
 }
 function requireCustomerAuth(req, res, next) {
@@ -114171,9 +114191,9 @@ router4.get("/dashboard/stats", requireAuth, async (_req, res) => {
   today.setHours(0, 0, 0, 0);
   const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
   const [salesStats] = await db.select({
-    todaySales: sql`coalesce(sum(case when created_at >= ${today.toISOString()} and is_return = false then total_amount::numeric else 0 end), 0)`,
-    monthSales: sql`coalesce(sum(case when created_at >= ${monthStart.toISOString()} and is_return = false then total_amount::numeric else 0 end), 0)`,
-    totalRevenue: sql`coalesce(sum(case when is_return = false then total_amount::numeric else 0 end), 0)`,
+    todaySales: sql`coalesce(sum(case when created_at >= ${today.toISOString()} then (case when is_return then -1 else 1 end) * total_amount::numeric else 0 end), 0)`,
+    monthSales: sql`coalesce(sum(case when created_at >= ${monthStart.toISOString()} then (case when is_return then -1 else 1 end) * total_amount::numeric else 0 end), 0)`,
+    totalRevenue: sql`coalesce(sum((case when is_return then -1 else 1 end) * total_amount::numeric), 0)`,
     totalReturns: sql`count(*) filter (where is_return = true)`
   }).from(salesTable);
   const [expiryStats] = await xr(sql`
@@ -114268,10 +114288,10 @@ router4.get("/dashboard/sales-chart", requireAuth, async (_req, res) => {
   const rows = await xr(sql`
     SELECT
       to_char(date_trunc('day', gs.day), 'YYYY-MM-DD') as date,
-      coalesce(sum(s.total_amount::numeric), 0) as sales,
-      count(s.id) as orders
+      coalesce(sum((case when s.is_return then -1 else 1 end) * s.total_amount::numeric), 0) as sales,
+      count(s.id) filter (where s.is_return = false) as orders
     FROM generate_series(current_date - interval '6 days', current_date, interval '1 day') gs(day)
-    LEFT JOIN sales s ON date_trunc('day', s.created_at) = gs.day AND s.is_return = false
+    LEFT JOIN sales s ON date_trunc('day', s.created_at) = gs.day
     GROUP BY gs.day ORDER BY gs.day
   `);
   res.json(rows.map((r) => ({ date: r.date, sales: Number(r.sales), orders: Number(r.orders) })));
@@ -116244,35 +116264,47 @@ router19.get("/reports/sales", requireAuth, async (req, res) => {
   const period = params.success && params.data.period ? params.data.period : "daily";
   const [totals] = await xr3(sql`
     SELECT
-      coalesce(sum(total_amount::numeric), 0) as total_revenue,
-      count(*) as total_orders,
-      coalesce(sum((select sum(quantity) from sale_items where sale_id = s.id)), 0) as total_items
+      coalesce(sum(total_amount::numeric) filter (where is_return = false), 0) as gross_sales,
+      coalesce(sum(total_amount::numeric) filter (where is_return = true), 0) as sales_returns,
+      count(*) filter (where is_return = false) as total_orders,
+      coalesce(sum((select sum(quantity) from sale_items where sale_id = s.id)) filter (where is_return = false), 0) as total_items
     FROM sales s
     WHERE created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
-      AND is_return = false
   `);
   const groupBy = period === "monthly" ? "date_trunc('month', created_at)::date" : period === "weekly" ? "date_trunc('week', created_at)::date" : "created_at::date";
   const data = await xr3(sql`
     SELECT
       ${sql.raw(groupBy)}::text as date,
-      count(*) as orders,
-      coalesce(sum(total_amount::numeric), 0) as revenue
+      count(*) filter (where is_return = false) as orders,
+      coalesce(sum(total_amount::numeric) filter (where is_return = false), 0) as gross_sales,
+      coalesce(sum(total_amount::numeric) filter (where is_return = true), 0) as sales_returns
     FROM sales
     WHERE created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
-      AND is_return = false
     GROUP BY ${sql.raw(groupBy)}
     ORDER BY ${sql.raw(groupBy)}
   `);
+  const grossSales = Number(totals?.gross_sales ?? 0);
+  const salesReturns = Number(totals?.sales_returns ?? 0);
+  const netSales = grossSales - salesReturns;
   res.json({
-    totalRevenue: Number(totals?.total_revenue ?? 0),
+    totalRevenue: netSales,
     totalOrders: Number(totals?.total_orders ?? 0),
     totalItems: Number(totals?.total_items ?? 0),
-    data: data.map((r) => ({
-      date: r.date,
-      sales: Number(r.orders),
-      orders: Number(r.orders),
-      revenue: Number(r.revenue)
-    }))
+    grossSales,
+    salesReturns,
+    netSales,
+    data: data.map((r) => {
+      const g = Number(r.gross_sales);
+      const ret = Number(r.sales_returns);
+      return {
+        date: r.date,
+        sales: Number(r.orders),
+        orders: Number(r.orders),
+        revenue: g - ret,
+        grossSales: g,
+        salesReturns: ret
+      };
+    })
   });
 });
 router19.get("/reports/inventory", requireAuth, async (_req, res) => {
@@ -116307,16 +116339,20 @@ router19.get("/reports/profit-loss", requireAuth, async (req, res) => {
   const endDate = params.success && params.data.endDate ? params.data.endDate : (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
   const [[rev], [cogs], [exp]] = await Promise.all([
     xr3(sql`
-      SELECT coalesce(sum(total_amount::numeric), 0) as revenue
+      SELECT
+        coalesce(sum(total_amount::numeric) filter (where is_return = false), 0) as gross_sales,
+        coalesce(sum(total_amount::numeric) filter (where is_return = true), 0) as sales_returns
       FROM sales
-      WHERE is_return = false AND created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+      WHERE created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
     `),
     xr3(sql`
-      SELECT coalesce(sum(si.quantity * p.cost_price::numeric), 0) as cogs
+      SELECT
+        coalesce(sum(si.quantity * p.cost_price::numeric) filter (where s.is_return = false), 0) as gross_cogs,
+        coalesce(sum(si.quantity * p.cost_price::numeric) filter (where s.is_return = true), 0) as returned_cogs
       FROM sale_items si
       JOIN products p ON p.id = si.product_id
       JOIN sales s ON s.id = si.sale_id
-      WHERE s.is_return = false AND s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+      WHERE s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
     `),
     xr3(sql`
       SELECT coalesce(sum(amount::numeric), 0) as expenses
@@ -116324,12 +116360,26 @@ router19.get("/reports/profit-loss", requireAuth, async (req, res) => {
       WHERE date::date BETWEEN ${startDate}::date AND ${endDate}::date
     `)
   ]);
-  const revenue = Number(rev?.revenue ?? 0);
-  const costOfGoods = Number(cogs?.cogs ?? 0);
+  const grossSales = Number(rev?.gross_sales ?? 0);
+  const salesReturns = Number(rev?.sales_returns ?? 0);
+  const revenue = grossSales - salesReturns;
+  const grossCogs = Number(cogs?.gross_cogs ?? 0);
+  const returnedCogs = Number(cogs?.returned_cogs ?? 0);
+  const costOfGoods = grossCogs - returnedCogs;
   const expenses = Number(exp?.expenses ?? 0);
   const grossProfit = revenue - costOfGoods;
   const netProfit = grossProfit - expenses;
-  res.json({ revenue, costOfGoods, grossProfit, expenses, netProfit });
+  res.json({
+    revenue,
+    costOfGoods,
+    grossProfit,
+    expenses,
+    netProfit,
+    grossSales,
+    salesReturns,
+    grossCogs,
+    returnedCogs
+  });
 });
 router19.get("/reports/product-sales", requireAuth, async (req, res) => {
   const { startDate, endDate } = dateRange(req);
@@ -116338,15 +116388,13 @@ router19.get("/reports/product-sales", requireAuth, async (req, res) => {
       p.id as product_id,
       p.name as product_name,
       p.sku,
-      coalesce(sum(si.quantity), 0) as total_qty,
-      coalesce(sum(si.quantity * si.price::numeric - si.discount::numeric), 0) as total_revenue,
-      coalesce(sum(si.quantity * p.cost_price::numeric), 0) as total_cost,
-      coalesce(sum(si.quantity * si.price::numeric - si.discount::numeric) - sum(si.quantity * p.cost_price::numeric), 0) as gross_profit
+      coalesce(sum(case when s.is_return then -si.quantity else si.quantity end), 0) as total_qty,
+      coalesce(sum((case when s.is_return then -1 else 1 end) * (si.quantity * si.price::numeric - si.discount::numeric)), 0) as total_revenue,
+      coalesce(sum((case when s.is_return then -1 else 1 end) * (si.quantity * p.cost_price::numeric)), 0) as total_cost
     FROM sale_items si
     JOIN products p ON p.id = si.product_id
     JOIN sales s ON s.id = si.sale_id
-    WHERE s.is_return = false
-      AND s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+    WHERE s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
     GROUP BY p.id, p.name, p.sku
     ORDER BY total_revenue DESC
   `);
@@ -116357,7 +116405,7 @@ router19.get("/reports/product-sales", requireAuth, async (req, res) => {
     totalQty: Number(r.total_qty),
     totalRevenue: Number(r.total_revenue),
     totalCost: Number(r.total_cost),
-    grossProfit: Number(r.gross_profit)
+    grossProfit: Number(r.total_revenue) - Number(r.total_cost)
   })));
 });
 router19.get("/reports/customer-sales", requireAuth, async (req, res) => {
@@ -116367,15 +116415,14 @@ router19.get("/reports/customer-sales", requireAuth, async (req, res) => {
       c.id as customer_id,
       c.name as customer_name,
       c.phone,
-      count(distinct s.id) as total_orders,
-      coalesce(sum(s.total_amount::numeric), 0) as total_amount,
-      coalesce(sum(s.discount::numeric), 0) as total_discount,
-      coalesce(sum(s.due_amount::numeric), 0) as total_due,
-      coalesce(sum(s.paid_amount::numeric), 0) as total_paid
+      count(distinct s.id) filter (where s.is_return = false) as total_orders,
+      coalesce(sum((case when s.is_return then -1 else 1 end) * s.total_amount::numeric), 0) as total_amount,
+      coalesce(sum(s.discount::numeric) filter (where s.is_return = false), 0) as total_discount,
+      coalesce(sum(s.due_amount::numeric) filter (where s.is_return = false), 0) as total_due,
+      coalesce(sum((case when s.is_return then -1 else 1 end) * s.paid_amount::numeric), 0) as total_paid
     FROM sales s
     JOIN customers c ON c.id = s.customer_id
-    WHERE s.is_return = false
-      AND s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+    WHERE s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
     GROUP BY c.id, c.name, c.phone
     ORDER BY total_amount DESC
   `);
@@ -116658,22 +116705,23 @@ router19.get("/reports/cash-handling", requireAuth, async (req, res) => {
   const { startDate, endDate } = dateRange(req);
   const [methods, [totals], creditRows] = await Promise.all([
     xr3(sql`
-      SELECT payment_method, count(*) as count,
-        coalesce(sum(total_amount::numeric), 0) as total,
-        coalesce(sum(paid_amount::numeric), 0) as collected,
-        coalesce(sum(due_amount::numeric), 0) as outstanding
+      SELECT payment_method,
+        count(*) filter (where is_return = false) as count,
+        coalesce(sum((case when is_return then -1 else 1 end) * total_amount::numeric), 0) as total,
+        coalesce(sum((case when is_return then -1 else 1 end) * paid_amount::numeric), 0) as collected,
+        coalesce(sum(due_amount::numeric) filter (where is_return = false), 0) as outstanding
       FROM sales
-      WHERE is_return = false AND created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+      WHERE created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
       GROUP BY payment_method ORDER BY total DESC
     `),
     xr3(sql`
       SELECT
-        coalesce(sum(total_amount::numeric), 0) as total_sales,
-        coalesce(sum(paid_amount::numeric), 0) as total_collected,
-        coalesce(sum(due_amount::numeric), 0) as total_due,
-        count(*) as total_transactions
+        coalesce(sum((case when is_return then -1 else 1 end) * total_amount::numeric), 0) as total_sales,
+        coalesce(sum((case when is_return then -1 else 1 end) * paid_amount::numeric), 0) as total_collected,
+        coalesce(sum(due_amount::numeric) filter (where is_return = false), 0) as total_due,
+        count(*) filter (where is_return = false) as total_transactions
       FROM sales
-      WHERE is_return = false AND created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+      WHERE created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
     `),
     xr3(sql`
       SELECT s.invoice_number, s.created_at,
@@ -116712,13 +116760,13 @@ router19.get("/reports/business-analysis", requireAuth, async (req, res) => {
   const [[sales], [purchasesRow], [purchaseReturnsRow], [expensesRow], [cogs], [returns], topProducts] = await Promise.all([
     xr3(sql`
       SELECT
-        coalesce(sum(total_amount::numeric), 0) as revenue,
-        coalesce(sum(discount::numeric), 0) as discounts,
-        count(*) as orders,
-        count(distinct customer_id) as unique_customers,
-        coalesce(avg(total_amount::numeric), 0) as avg_order_value
+        coalesce(sum(total_amount::numeric) filter (where is_return = false), 0) as gross_sales,
+        coalesce(sum(total_amount::numeric) filter (where is_return = true), 0) as sales_returns,
+        coalesce(sum(discount::numeric) filter (where is_return = false), 0) as discounts,
+        count(*) filter (where is_return = false) as orders,
+        count(distinct customer_id) filter (where is_return = false) as unique_customers
       FROM sales
-      WHERE is_return = false AND created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+      WHERE created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
     `),
     xr3(sql`
       SELECT coalesce(sum(total_amount::numeric), 0) as total
@@ -116733,37 +116781,47 @@ router19.get("/reports/business-analysis", requireAuth, async (req, res) => {
       FROM expenses WHERE date::date BETWEEN ${startDate}::date AND ${endDate}::date
     `),
     xr3(sql`
-      SELECT coalesce(sum(si.quantity * p.cost_price::numeric), 0) as cogs
+      SELECT
+        coalesce(sum(si.quantity * p.cost_price::numeric) filter (where s.is_return = false), 0) as gross_cogs,
+        coalesce(sum(si.quantity * p.cost_price::numeric) filter (where s.is_return = true), 0) as returned_cogs
       FROM sale_items si
       JOIN products p ON p.id = si.product_id
       JOIN sales s ON s.id = si.sale_id
-      WHERE s.is_return = false AND s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+      WHERE s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
     `),
     xr3(sql`
       SELECT coalesce(sum(total_amount::numeric), 0) as total, count(*) as count
       FROM sales WHERE is_return = true AND created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
     `),
     xr3(sql`
-      SELECT p.name, coalesce(sum(si.quantity), 0) as qty,
-        coalesce(sum(si.quantity * si.price::numeric - si.discount::numeric), 0) as revenue
+      SELECT p.name,
+        coalesce(sum(case when s.is_return then -si.quantity else si.quantity end), 0) as qty,
+        coalesce(sum((case when s.is_return then -1 else 1 end) * (si.quantity * si.price::numeric - si.discount::numeric)), 0) as revenue
       FROM sale_items si
       JOIN products p ON p.id = si.product_id
       JOIN sales s ON s.id = si.sale_id
-      WHERE s.is_return = false AND s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
+      WHERE s.created_at::date BETWEEN ${startDate}::date AND ${endDate}::date
       GROUP BY p.name ORDER BY revenue DESC LIMIT 5
     `)
   ]);
-  const revenue = Number(sales?.revenue ?? 0);
-  const cogsVal = Number(cogs?.cogs ?? 0);
+  const grossSales = Number(sales?.gross_sales ?? 0);
+  const salesReturns = Number(sales?.sales_returns ?? 0);
+  const revenue = grossSales - salesReturns;
+  const grossCogs = Number(cogs?.gross_cogs ?? 0);
+  const returnedCogs = Number(cogs?.returned_cogs ?? 0);
+  const cogsVal = grossCogs - returnedCogs;
   const expensesVal = Number(expensesRow?.total ?? 0);
+  const orders = Number(sales?.orders ?? 0);
   const grossProfit = revenue - cogsVal;
   const netProfit = grossProfit - expensesVal;
   res.json({
     revenue,
+    grossSales,
+    salesReturns,
     discounts: Number(sales?.discounts ?? 0),
-    orders: Number(sales?.orders ?? 0),
+    orders,
     uniqueCustomers: Number(sales?.unique_customers ?? 0),
-    avgOrderValue: Number(sales?.avg_order_value ?? 0),
+    avgOrderValue: orders > 0 ? revenue / orders : 0,
     purchases: Number(purchasesRow?.total ?? 0),
     purchaseReturns: Number(purchaseReturnsRow?.total ?? 0),
     purchaseReturnsCount: Number(purchaseReturnsRow?.count ?? 0),
@@ -117964,7 +118022,7 @@ var book_catalog_default = router24;
 // src/routes/admin.ts
 var import_express25 = __toESM(require_express2(), 1);
 var router25 = (0, import_express25.Router)();
-router25.post("/admin/reset-data", requireAuth, async (req, res) => {
+router25.post("/admin/reset-data", requireAuth, requireAdmin, async (req, res) => {
   await db.execute(sql`ALTER TABLE sales ADD COLUMN IF NOT EXISTS original_sale_id integer`);
   await db.execute(sql`TRUNCATE
     sale_items, sales,
