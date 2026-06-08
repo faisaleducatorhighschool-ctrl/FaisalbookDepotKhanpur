@@ -1,0 +1,101 @@
+name: Deploy to Hostinger
+
+# Builds the full Tech Mentor ERP & POS bundle (Express API server + the three
+# SPAs: ERP "/", Store "/store", Customer "/customer-app") and uploads the
+# ready-to-run package to Hostinger over FTP.
+#
+# Required GitHub repository secrets (Settings -> Secrets and variables -> Actions):
+#   HOSTINGER_FTP_SERVER    - FTP host, e.g. ftp.yourdomain.com (or the IP Hostinger shows)
+#   HOSTINGER_FTP_USERNAME  - FTP username from hPanel -> Files -> FTP Accounts
+#   HOSTINGER_FTP_PASSWORD  - that FTP account's password
+# Optional repository variable (Settings -> Secrets and variables -> Actions -> Variables):
+#   HOSTINGER_FTP_SERVER_DIR - target folder on the host (default: the Node app root below)
+#
+# After the files land on Hostinger, restart the Node.js app in hPanel (or it
+# restarts on the next request). DATABASE_URL and SESSION_SECRET are set in the
+# Hostinger dashboard, NOT here.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-hostinger
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prod=false
+
+      - name: Build API server
+        run: pnpm --filter @workspace/api-server run build
+
+      - name: Build ERP admin (/)
+        run: PORT=3000 BASE_PATH=/ NODE_ENV=production pnpm --filter @workspace/smart-retail-erp run build
+
+      - name: Build Store (/store)
+        run: PORT=3001 BASE_PATH=/store/ NODE_ENV=production pnpm --filter @workspace/store run build
+
+      - name: Build Customer app (/customer-app)
+        run: PORT=3002 BASE_PATH=/customer-app/ NODE_ENV=production pnpm --filter @workspace/customer-app run build
+
+      - name: Assemble Hostinger deploy bundle
+        run: |
+          set -euo pipefail
+          rm -rf _deploy
+          mkdir -p _deploy/artifacts/api-server/dist
+          mkdir -p _deploy/artifacts/smart-retail-erp/dist
+          mkdir -p _deploy/artifacts/store/dist
+          mkdir -p _deploy/artifacts/customer-app/dist
+
+          # Hostinger entry wrapper + its own (small) runtime dependencies.
+          cp hostinger-deploy/index.js _deploy/
+          cp hostinger-deploy/package.json _deploy/
+          cp hostinger-deploy/package-lock.json _deploy/
+
+          # Bundled Express server (entry is hostinger.mjs; ship maps + pino workers).
+          cp artifacts/api-server/dist/*.mjs _deploy/artifacts/api-server/dist/
+          cp artifacts/api-server/dist/*.mjs.map _deploy/artifacts/api-server/dist/ 2>/dev/null || true
+
+          # Built SPAs served by the API server in production.
+          cp -r artifacts/smart-retail-erp/dist/public _deploy/artifacts/smart-retail-erp/dist/public
+          cp -r artifacts/store/dist/public _deploy/artifacts/store/dist/public
+          cp -r artifacts/customer-app/dist/public _deploy/artifacts/customer-app/dist/public
+
+          echo "Bundle contents:"
+          find _deploy -maxdepth 4 -type d | sort
+
+      - name: Deploy via FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.HOSTINGER_FTP_SERVER }}
+          username: ${{ secrets.HOSTINGER_FTP_USERNAME }}
+          password: ${{ secrets.HOSTINGER_FTP_PASSWORD }}
+          local-dir: ./_deploy/
+          server-dir: ${{ vars.HOSTINGER_FTP_SERVER_DIR || '/domains/your-domain/public_node/' }}
+          protocol: ftps
+          # Files that live on the host but not in the build (env files, uploads, etc.).
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/node_modules/**
+            .env
+            .env.*

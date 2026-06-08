@@ -1,0 +1,19 @@
+{
+  "name": "tech-mentor-erp-hostinger",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tech Mentor ERP & POS - prebuilt, self-contained deploy for Hostinger Node.js hosting (MySQL)",
+  "main": "index.js",
+  "scripts": {
+    "build": "echo no build step",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mysql2": "^3.22.5",
+    "@google-cloud/storage": "^7.19.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

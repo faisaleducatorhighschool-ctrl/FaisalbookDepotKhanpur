@@ -1,0 +1,18 @@
+# ─────────────────────────────────────────────────────────────────
+# Tech Mentor ERP & POS — Railway deployment configuration
+# Single web service: API server also serves ERP (/), Store (/store),
+# and Customer web app (/customer-app). Pair with a MySQL database
+# (e.g. a Railway MySQL plugin) and set DATABASE_URL accordingly.
+# Production target is Hostinger MySQL via GitHub — see replit.md.
+# ─────────────────────────────────────────────────────────────────
+
+[build]
+builder = "nixpacks"
+buildCommand = "npm install -g pnpm@10 && pnpm install --frozen-lockfile --prod=false && pnpm --filter @workspace/api-server run build && PORT=3000 BASE_PATH=/ NODE_ENV=production pnpm --filter @workspace/smart-retail-erp run build && PORT=3001 BASE_PATH=/store/ NODE_ENV=production pnpm --filter @workspace/store run build && PORT=3002 BASE_PATH=/customer-app/ NODE_ENV=production pnpm --filter @workspace/customer-app run build"
+
+[deploy]
+startCommand = "pnpm --filter @workspace/db run push && NODE_ENV=production node --enable-source-maps artifacts/api-server/dist/index.mjs"
+healthcheckPath = "/api/healthz"
+healthcheckTimeout = 60
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
